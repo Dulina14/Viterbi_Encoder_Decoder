@@ -8,10 +8,12 @@ module tb_encoder_decoder_throughput;
   localparam int INPUT_WORD_WIDTH  = 32;
   localparam int DEC_IN_WORD_WIDTH = 32;
   localparam int DEC_OUT_VALID_BITS = 16;
-  localparam int INPUT_BITS_PER_TXN = 32;
+  localparam int INPUT_BITS_PER_TXN = INPUT_WORD_WIDTH;
   localparam int NUM_TRANSACTIONS   = 1000;
   localparam int FIFO_DEPTH         = 64;
   localparam int CLK_PERIOD_NS      = 10;
+  localparam int TIMEOUT_CYCLES     = 2000000;
+  localparam int MSB_INDEX          = INPUT_WORD_WIDTH - 1;
   localparam real CLOCK_FREQ_MHZ    = 1000.0 / CLK_PERIOD_NS;
 
   localparam longint TOTAL_INPUT_BITS_TARGET = NUM_TRANSACTIONS * INPUT_BITS_PER_TXN;
@@ -100,20 +102,18 @@ module tb_encoder_decoder_throughput;
   // (encoder accepts 1-bit stream; each input word is serialized)
   // ============================================================
   logic [31:0] current_input_word;
-  int          current_input_bit_idx;
+  int          current_input_bit_pos;
   int          input_word_count;
   logic        input_done;
-  logic        current_input_word_loaded;
 
   wire enc_in_fire = enc_s_tvalid && enc_s_tready;
 
   always_ff @(posedge ap_clk or negedge ap_rst_n) begin
     if (!ap_rst_n) begin
-      current_input_word    <= '0;
-      current_input_bit_idx <= 0;
+      current_input_word    <= $urandom;
+      current_input_bit_pos <= 0;
       input_word_count      <= 0;
       input_done            <= 1'b0;
-      current_input_word_loaded <= 1'b0;
       enc_s_tvalid          <= 1'b0;
       enc_s_tdata           <= '0;
       enc_s_tkeep           <= 1'b1;
@@ -125,18 +125,14 @@ module tb_encoder_decoder_throughput;
       enc_s_tstrb <= 1'b1;
 
       if (!input_done) begin
-        if (!current_input_word_loaded) begin
-          current_input_word <= $urandom;
-          current_input_word_loaded <= 1'b1;
-        end
-
         enc_s_tvalid <= 1'b1;
-        enc_s_tdata  <= current_input_word[31 - current_input_bit_idx];
-        enc_s_tlast  <= (current_input_bit_idx == (INPUT_BITS_PER_TXN - 1));
+        // Serialize each 32-bit word MSB-first into the encoder's 1-bit input stream.
+        enc_s_tdata  <= current_input_word[MSB_INDEX - current_input_bit_pos];
+        enc_s_tlast  <= (current_input_bit_pos == (INPUT_BITS_PER_TXN - 1));
 
         if (enc_in_fire) begin
-          if (current_input_bit_idx == (INPUT_BITS_PER_TXN - 1)) begin
-            current_input_bit_idx <= 0;
+          if (current_input_bit_pos == (INPUT_BITS_PER_TXN - 1)) begin
+            current_input_bit_pos <= 0;
             input_word_count <= input_word_count + 1;
             if ((input_word_count + 1) >= NUM_TRANSACTIONS) begin
               input_done   <= 1'b1;
@@ -146,7 +142,7 @@ module tb_encoder_decoder_throughput;
               current_input_word <= $urandom;
             end
           end else begin
-            current_input_bit_idx <= current_input_bit_idx + 1;
+            current_input_bit_pos <= current_input_bit_pos + 1;
           end
         end
       end else begin
@@ -177,7 +173,8 @@ module tb_encoder_decoder_throughput;
   wire enc_out_fire = enc_m_tvalid && enc_m_tready;
   wire dec_in_fire  = dec_in_tvalid && dec_in_tready;
   wire push_word    = enc_out_fire && (pack_bit_count == (DEC_IN_WORD_WIDTH - 1));
-  wire [31:0] push_word_data = {pack_shift_reg[30:0], enc_m_tdata};
+  // Pack encoder output bits by shifting left and inserting newest bit at LSB.
+  wire [31:0] push_word_data = {pack_shift_reg[DEC_IN_WORD_WIDTH-2:0], enc_m_tdata};
   wire        push_word_tlast = enc_m_tlast;
 
   // TREADY always high except when a completed packed word cannot enter FIFO
@@ -219,7 +216,7 @@ module tb_encoder_decoder_throughput;
         end else begin
           pack_bit_count <= pack_bit_count + 1;
         end
-        pack_shift_reg <= {pack_shift_reg[30:0], enc_m_tdata};
+        pack_shift_reg <= {pack_shift_reg[DEC_IN_WORD_WIDTH-2:0], enc_m_tdata};
       end
 
       // FIFO push/pop with correct handling of simultaneous operations
@@ -310,7 +307,7 @@ module tb_encoder_decoder_throughput;
         end
       end
 
-      if (dec_in_tvalid && dec_in_tready) begin
+      if (dec_in_fire) begin
         decoder_input_active_cycles <= decoder_input_active_cycles + 1;
       end
 
@@ -350,8 +347,7 @@ module tb_encoder_decoder_throughput;
     @(posedge ap_clk);
 
     if (cycle_count > 0) begin
-      throughput_bpc = total_output_bits_received;
-      throughput_bpc = throughput_bpc / cycle_count;
+      throughput_bpc = real'(total_output_bits_received) / cycle_count;
       throughput_mbps = throughput_bpc * CLOCK_FREQ_MHZ;
     end
 
@@ -359,8 +355,7 @@ module tb_encoder_decoder_throughput;
       longint steady_cycles;
       steady_cycles = (last_output_cycle - first_output_cycle + 1);
       if (steady_cycles > 0) begin
-        steady_bpc = total_output_bits_received;
-        steady_bpc = steady_bpc / steady_cycles;
+        steady_bpc = real'(total_output_bits_received) / steady_cycles;
         steady_mbps = steady_bpc * CLOCK_FREQ_MHZ;
       end
     end
@@ -370,13 +365,12 @@ module tb_encoder_decoder_throughput;
     end
 
     if (cycle_count > 0) begin
-      decoder_input_utilization = decoder_input_active_cycles;
-      decoder_input_utilization = decoder_input_utilization / cycle_count;
+      decoder_input_utilization = real'(decoder_input_active_cycles) / cycle_count;
     end
 
     if (total_output_words_received > 1) begin
-      output_avg_ii = (last_output_cycle - first_output_cycle);
-      output_avg_ii = output_avg_ii / (total_output_words_received - 1);
+      output_avg_ii = real'(last_output_cycle - first_output_cycle) /
+                      real'(total_output_words_received - 1);
     end else begin
       output_avg_ii = 0.0;
     end
@@ -405,7 +399,7 @@ module tb_encoder_decoder_throughput;
 
   // timeout guard
   initial begin : timeout_guard
-    #(CLK_PERIOD_NS * 2000000);
+    #(CLK_PERIOD_NS * TIMEOUT_CYCLES);
     $display("ERROR: Timeout before receiving expected decoded bits.");
     $finish;
   end
